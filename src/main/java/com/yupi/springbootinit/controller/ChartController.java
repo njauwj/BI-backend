@@ -23,6 +23,7 @@ import com.yupi.springbootinit.service.ChartService;
 import com.yupi.springbootinit.service.UserService;
 import com.yupi.springbootinit.utils.ExcelUtils;
 import com.yupi.springbootinit.utils.SqlUtils;
+import io.netty.util.concurrent.CompleteFuture;
 import lombok.extern.slf4j.Slf4j;
 import org.apache.commons.lang3.ObjectUtils;
 import org.apache.commons.lang3.StringUtils;
@@ -35,6 +36,8 @@ import javax.servlet.http.HttpServletRequest;
 
 import java.util.Arrays;
 import java.util.List;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ThreadPoolExecutor;
 
 import static com.yupi.springbootinit.constant.AIConstant.MODEL_ID;
 
@@ -54,6 +57,9 @@ public class ChartController {
 
     @Resource
     private AIManager aiManager;
+
+    @Resource
+    private ThreadPoolExecutor threadPoolExecutor;
 
     @Resource
     private RedisLimiterManager redisLimiterManager;
@@ -260,6 +266,64 @@ public class ChartController {
         String chatConclusion = message[2];
         Long chartId = addChartToDb(userId, genChartByAiRequest, chartData, chatCode, chatConclusion);
         BiResponse biResponse = new BiResponse(chatCode, chatConclusion, chartId);
+        return ResultUtils.success(biResponse);
+    }
+
+    @PostMapping("/gen/async")
+    public BaseResponse<BiResponse> genChartByAiAsync(@RequestPart("file") MultipartFile multipartFile, GenChartByAiRequest genChartByAiRequest, HttpServletRequest request) {
+        Long userId = userService.getLoginUser(request).getId();
+        //实现用户请求的限流
+        redisLimiterManager.allowRequest("genChartByAi:" + userId);
+        long size = multipartFile.getSize();
+        int maxSize = 1024 * 1024;//1Mb
+        ThrowUtils.throwIf(size > maxSize, ErrorCode.PARAMS_ERROR, "文件太大");
+        String suffix = FileUtil.getSuffix(multipartFile.getOriginalFilename());
+        List<String> validSuffix = Arrays.asList(".xls", "xlsx", "csv");
+        ThrowUtils.throwIf(!validSuffix.contains(suffix), ErrorCode.PARAMS_ERROR, "上传文件格式错误");
+        String name = genChartByAiRequest.getName();
+        String goal = genChartByAiRequest.getGoal();
+        String chartType = genChartByAiRequest.getChartType();
+        // 校验
+        ThrowUtils.throwIf(StringUtils.isBlank(goal), ErrorCode.PARAMS_ERROR, "目标为空");
+        ThrowUtils.throwIf(StringUtils.isNotBlank(name) && name.length() > 100, ErrorCode.PARAMS_ERROR, "名称过长");
+        // 用户输入
+        StringBuilder userInput = new StringBuilder();
+        if (StringUtils.isNotBlank(chartType)) {
+            goal = "使用" + chartType + "," + goal;
+        }
+        userInput.append("分析需求:\n").append(goal).append("\n");
+        // 压缩后的数据
+        String chartData = ExcelUtils.excelToCsv(multipartFile);
+        userInput.append("原始数据:\n").append(chartData).append("\n");
+        Chart chart = new Chart();
+        chart.setName(genChartByAiRequest.getName());
+        chart.setGoal(genChartByAiRequest.getGoal());
+        chart.setChartData(chartData);
+        chart.setChartType(genChartByAiRequest.getChartType());
+        chart.setUserId(userId);
+        boolean save = chartService.save(chart);
+        ThrowUtils.throwIf(!save, ErrorCode.PARAMS_ERROR, "图表生成任务添加到数据库失败");
+        //异步执行
+        CompletableFuture.runAsync(() -> {
+            try {
+                chart.setStatus("running");
+                chartService.updateById(chart);
+                String[] message = aiManager.doChat(MODEL_ID, userInput.toString()).split("【【【【【");
+                ThrowUtils.throwIf(message.length != 3, ErrorCode.PARAMS_ERROR, "AI生成数据失败");
+                String chatCode = message[1];
+                String chatConclusion = message[2];
+                chart.setGenChart(chatCode);
+                chart.setGenResult(chatConclusion);
+                chart.setStatus("succeed");
+                chartService.updateById(chart);
+            } catch (Exception e) {
+                chart.setStatus("failed");
+                chart.setExecMessage("AI生成图表失败");
+                chartService.updateById(chart);
+            }
+        }, threadPoolExecutor);
+        BiResponse biResponse = new BiResponse();
+        biResponse.setChartId(chart.getId());
         return ResultUtils.success(biResponse);
     }
 
