@@ -19,6 +19,7 @@ import com.yupi.springbootinit.model.dto.chart.*;
 import com.yupi.springbootinit.model.entity.Chart;
 import com.yupi.springbootinit.model.entity.User;
 import com.yupi.springbootinit.model.vo.BiResponse;
+import com.yupi.springbootinit.mq.MqProducer;
 import com.yupi.springbootinit.service.ChartService;
 import com.yupi.springbootinit.service.UserService;
 import com.yupi.springbootinit.utils.ExcelUtils;
@@ -63,6 +64,9 @@ public class ChartController {
 
     @Resource
     private RedisLimiterManager redisLimiterManager;
+
+    @Resource
+    private MqProducer mqProducer;
 
     private final static Gson GSON = new Gson();
 
@@ -297,7 +301,7 @@ public class ChartController {
         userInput.append("原始数据:\n").append(chartData).append("\n");
         Chart chart = new Chart();
         chart.setName(genChartByAiRequest.getName());
-        chart.setGoal(genChartByAiRequest.getGoal());
+        chart.setGoal(goal);
         chart.setChartData(chartData);
         chart.setChartType(genChartByAiRequest.getChartType());
         chart.setUserId(userId);
@@ -309,7 +313,7 @@ public class ChartController {
                 chart.setStatus("running");
                 chartService.updateById(chart);
                 String[] message = aiManager.doChat(MODEL_ID, userInput.toString()).split("【【【【【");
-                ThrowUtils.throwIf(message.length != 3, ErrorCode.PARAMS_ERROR, "AI生成数据失败");
+                ThrowUtils.throwIf(message.length != 3, ErrorCode.PARAMS_ERROR, "生成数据失败请重试");
                 String chatCode = message[1];
                 String chatConclusion = message[2];
                 chart.setGenChart(chatCode);
@@ -322,6 +326,45 @@ public class ChartController {
                 chartService.updateById(chart);
             }
         }, threadPoolExecutor);
+        BiResponse biResponse = new BiResponse();
+        biResponse.setChartId(chart.getId());
+        return ResultUtils.success(biResponse);
+    }
+
+
+    @PostMapping("/gen/async/mq")
+    public BaseResponse<BiResponse> genChartByAiAsyncMq(@RequestPart("file") MultipartFile multipartFile, GenChartByAiRequest genChartByAiRequest, HttpServletRequest request) {
+        Long userId = userService.getLoginUser(request).getId();
+        //实现用户请求的限流
+        redisLimiterManager.allowRequest("genChartByAi:" + userId);
+        long size = multipartFile.getSize();
+        int maxSize = 1024 * 1024;//1Mb
+        ThrowUtils.throwIf(size > maxSize, ErrorCode.PARAMS_ERROR, "文件太大");
+        String suffix = FileUtil.getSuffix(multipartFile.getOriginalFilename());
+        List<String> validSuffix = Arrays.asList(".xls", "xlsx", "csv");
+        ThrowUtils.throwIf(!validSuffix.contains(suffix), ErrorCode.PARAMS_ERROR, "上传文件格式错误");
+        String name = genChartByAiRequest.getName();
+        String goal = genChartByAiRequest.getGoal();
+        String chartType = genChartByAiRequest.getChartType();
+        // 校验
+        ThrowUtils.throwIf(StringUtils.isBlank(goal), ErrorCode.PARAMS_ERROR, "目标为空");
+        ThrowUtils.throwIf(StringUtils.isNotBlank(name) && name.length() > 100, ErrorCode.PARAMS_ERROR, "名称过长");
+        // 用户输入
+        if (StringUtils.isNotBlank(chartType)) {
+            goal = "使用" + chartType + "," + goal;
+        }
+        // 压缩后的数据
+        String chartData = ExcelUtils.excelToCsv(multipartFile);
+        Chart chart = new Chart();
+        chart.setName(genChartByAiRequest.getName());
+        chart.setGoal(goal);
+        chart.setChartData(chartData);
+        chart.setChartType(genChartByAiRequest.getChartType());
+        chart.setUserId(userId);
+        boolean save = chartService.save(chart);
+        ThrowUtils.throwIf(!save, ErrorCode.PARAMS_ERROR, "图表生成任务添加到数据库失败");
+        //发送消息
+        mqProducer.sendMessage(chart.getId().toString());
         BiResponse biResponse = new BiResponse();
         biResponse.setChartId(chart.getId());
         return ResultUtils.success(biResponse);
